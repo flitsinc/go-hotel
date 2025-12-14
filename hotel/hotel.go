@@ -6,10 +6,10 @@ import (
 	"sync"
 )
 
-// maxRoomRetries is the maximum number of times GetOrCreateRoom will retry
-// when encountering a closed room. This prevents infinite loops when rooms
-// are closing faster than they can be created (e.g., due to handler bugs).
-const maxRoomRetries = 3
+// maxRoomAttempts is the maximum number of times GetOrCreateRoom will attempt
+// to create a room when encountering closed rooms. This prevents infinite loops
+// when rooms are closing faster than they can be created (e.g., due to handler bugs).
+const maxRoomAttempts = 3
 
 // Hotel manages a collection of virtual rooms that can be created on demand.
 // It handles room lifecycle including creation, access, and cleanup when rooms are no longer needed.
@@ -39,14 +39,15 @@ func New[RoomMetadata, ClientMetadata, DataType any](init RoomInitFunc[RoomMetad
 // If the room initialization fails, the room is cleaned up and an error is returned.
 // The room is automatically removed from the hotel when it's closed.
 // If the room closes immediately after creation (e.g., due to handler errors), this function
-// will retry up to maxRoomRetries times before returning an error.
+// will attempt up to maxRoomAttempts times before returning an error.
 func (h *Hotel[RoomMetadata, ClientMetadata, DataType]) GetOrCreateRoom(id string) (*Room[RoomMetadata, ClientMetadata, DataType], error) {
 	if id == "" {
 		return nil, errors.New("invalid room id: cannot be empty")
 	}
 
-	retries := 0
+	attempt := 0
 	for {
+		attempt++
 		var room *Room[RoomMetadata, ClientMetadata, DataType]
 		var exists bool
 
@@ -110,9 +111,8 @@ func (h *Hotel[RoomMetadata, ClientMetadata, DataType]) GetOrCreateRoom(id strin
 			}
 			h.mu.Unlock()
 
-			retries++
-			if retries >= maxRoomRetries {
-				return nil, fmt.Errorf("room %q closed immediately after creation (retried %d times)", id, retries)
+			if attempt >= maxRoomAttempts {
+				return nil, fmt.Errorf("room %q closed immediately after creation (attempt %d/%d)", id, attempt, maxRoomAttempts)
 			}
 			continue
 		default:

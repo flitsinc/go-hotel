@@ -493,7 +493,7 @@ func TestRoomInitPanicRecovery(t *testing.T) {
 }
 
 // TestGetOrCreateRoomRetryLimit verifies that GetOrCreateRoom fails after
-// maxRoomRetries when rooms keep closing immediately.
+// maxRoomAttempts when rooms keep closing immediately.
 func TestGetOrCreateRoomRetryLimit(t *testing.T) {
 	// Track how many times init was called to verify retries are happening
 	initCount := 0
@@ -519,8 +519,7 @@ func TestGetOrCreateRoomRetryLimit(t *testing.T) {
 	finalCount := initCount
 	mu.Unlock()
 
-	// The room init should have been called at least maxRoomRetries times
-	// (3 retries + possibly the initial attempt depending on timing)
+	// The room init should have been called up to maxRoomAttempts times
 	t.Logf("Init was called %d times", finalCount)
 
 	if err == nil {
