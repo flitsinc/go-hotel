@@ -73,7 +73,9 @@ func newRoom[RoomMetadata, ClientMetadata, DataType any](id string, init RoomIni
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		room.mu.Lock()
 		room.metadata = metadata
+		room.mu.Unlock()
 
 		go func() {
 			defer func() {
@@ -105,6 +107,8 @@ func (r *Room[RoomMetadata, ClientMetadata, DataType]) Events() <-chan Event[Cli
 
 // Metadata returns the room's metadata.
 func (r *Room[RoomMetadata, ClientMetadata, DataType]) Metadata() *RoomMetadata {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	return r.metadata
 }
 
