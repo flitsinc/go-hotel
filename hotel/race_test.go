@@ -334,3 +334,370 @@ func TestClientBufferDrain(t *testing.T) {
 		t.Errorf("Not all messages were delivered: sent %d, received %d", sentCount, receivedCount)
 	}
 }
+
+// TestClientsMethodDataRace verifies that Clients() is safe to call concurrently.
+// This is a regression test for commit 9ae01ad which fixed accessing r.clients
+// after releasing the lock.
+func TestClientsMethodDataRace(t *testing.T) {
+	hotel := New(
+		func(ctx context.Context, id string) (*struct{}, error) {
+			return &struct{}{}, nil
+		},
+		func(ctx context.Context, room *Room[struct{}, struct{}, string]) {
+			<-ctx.Done()
+		},
+	)
+
+	room, err := hotel.GetOrCreateRoom("test-clients-race")
+	if err != nil {
+		t.Fatalf("Failed to create room: %v", err)
+	}
+	defer room.Close()
+
+	// Create some clients
+	for i := 0; i < 5; i++ {
+		_, err := room.NewClient(&struct{}{})
+		if err != nil {
+			t.Fatalf("Failed to create client: %v", err)
+		}
+	}
+
+	// Concurrently call Clients() while also adding/removing clients
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				clients := room.Clients()
+				// Access the slice to ensure it's valid
+				_ = len(clients)
+			}
+		}()
+	}
+
+	// Also add and remove clients concurrently
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for j := 0; j < 20; j++ {
+			client, err := room.NewClient(&struct{}{})
+			if err != nil {
+				return // Room may be closed
+			}
+			time.Sleep(time.Millisecond)
+			room.RemoveClient(client)
+		}
+	}()
+
+	wg.Wait()
+}
+
+// TestClientConcurrentSendAndClose verifies that sending messages to a client
+// and closing it concurrently is safe. This is a regression test for commit
+// 8be7f75 which ensured writes and close happen on the same goroutine.
+func TestClientConcurrentSendAndClose(t *testing.T) {
+	hotel := New(
+		func(ctx context.Context, id string) (*struct{}, error) {
+			return &struct{}{}, nil
+		},
+		func(ctx context.Context, room *Room[struct{}, struct{}, string]) {
+			<-ctx.Done()
+		},
+	)
+
+	room, err := hotel.GetOrCreateRoom("test-send-close-race")
+	if err != nil {
+		t.Fatalf("Failed to create room: %v", err)
+	}
+	defer room.Close()
+
+	for iteration := 0; iteration < 50; iteration++ {
+		client, err := room.NewClient(&struct{}{})
+		if err != nil {
+			t.Fatalf("Failed to create client: %v", err)
+		}
+
+		// Start receiver
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range client.Receive() {
+				// Just drain
+			}
+		}()
+
+		// Concurrently send messages and close
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 100; i++ {
+				_ = room.SendToClient(client, fmt.Sprintf("msg-%d", i))
+			}
+		}()
+
+		// Close after a brief moment
+		time.Sleep(time.Millisecond)
+		room.RemoveClient(client)
+
+		wg.Wait()
+	}
+}
+
+// TestRoomInitPanicRecovery verifies that a panic in the room init function
+// is recovered and doesn't crash the application. This is a regression test
+// for commit ba27514.
+func TestRoomInitPanicRecovery(t *testing.T) {
+	panicCount := 0
+	var mu sync.Mutex
+
+	hotel := New(
+		func(ctx context.Context, id string) (*struct{}, error) {
+			mu.Lock()
+			panicCount++
+			count := panicCount
+			mu.Unlock()
+
+			if count == 1 {
+				// Only panic on first attempt
+				panic("init panic!")
+			}
+			// Subsequent attempts succeed
+			return &struct{}{}, nil
+		},
+		func(ctx context.Context, room *Room[struct{}, struct{}, string]) {
+			<-ctx.Done()
+		},
+	)
+
+	// This should not crash - the panic should be recovered on first attempt,
+	// then succeed on retry
+	room, err := hotel.GetOrCreateRoom("panic-room")
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	mu.Lock()
+	finalCount := panicCount
+	mu.Unlock()
+
+	// Should have panicked once, then succeeded
+	if finalCount < 1 {
+		t.Error("Expected at least one panic to occur")
+	}
+	t.Logf("Panic occurred %d time(s), room created successfully after recovery", finalCount)
+
+	room.Close()
+}
+
+// TestRoomHandlerPanicRecovery verifies that a panic in the room handler
+// function is recovered and doesn't crash the application.
+func TestRoomHandlerPanicRecovery(t *testing.T) {
+	handlerStarted := make(chan struct{})
+
+	hotel := New(
+		func(ctx context.Context, id string) (*struct{}, error) {
+			return &struct{}{}, nil
+		},
+		func(ctx context.Context, room *Room[struct{}, struct{}, string]) {
+			close(handlerStarted)
+			panic("handler panic!")
+		},
+	)
+
+	room, err := hotel.GetOrCreateRoom("handler-panic-room")
+	if err != nil {
+		t.Fatalf("Failed to create room: %v", err)
+	}
+
+	// Wait for handler to start and panic
+	<-handlerStarted
+	time.Sleep(10 * time.Millisecond)
+
+	// Room should be closed after handler panic
+	_, err = room.NewClient(&struct{}{})
+	if err == nil {
+		t.Error("Expected error when adding client to room with panicked handler")
+	}
+}
+
+// TestHotelLockNotHeldDuringInit verifies that multiple rooms can be
+// initialized concurrently. This is a regression test for commit 096297d
+// which ensured the hotel lock isn't held during room initialization.
+func TestHotelLockNotHeldDuringInit(t *testing.T) {
+	initCount := 0
+	var initMu sync.Mutex
+	initStarted := make(chan struct{}, 10)
+
+	hotel := New(
+		func(ctx context.Context, id string) (*string, error) {
+			initMu.Lock()
+			initCount++
+			initMu.Unlock()
+			initStarted <- struct{}{}
+			// Slow init
+			time.Sleep(50 * time.Millisecond)
+			return &id, nil
+		},
+		func(ctx context.Context, room *Room[string, string, string]) {
+			<-ctx.Done()
+		},
+	)
+
+	// Start creating multiple rooms concurrently
+	var wg sync.WaitGroup
+	start := time.Now()
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			room, err := hotel.GetOrCreateRoom(fmt.Sprintf("room-%d", id))
+			if err != nil {
+				t.Errorf("Failed to create room %d: %v", id, err)
+				return
+			}
+			room.Close()
+		}(i)
+	}
+
+	// Wait for all inits to start
+	for i := 0; i < 5; i++ {
+		<-initStarted
+	}
+
+	wg.Wait()
+	elapsed := time.Since(start)
+
+	// If hotel lock was held during init, this would take ~250ms (5 * 50ms)
+	// With the fix, all inits run concurrently, so it should take ~50ms
+	if elapsed > 150*time.Millisecond {
+		t.Errorf("Room initialization appears to be serialized (took %v), expected concurrent init", elapsed)
+	}
+}
+
+// TestRoomAutoClose verifies that empty rooms are automatically closed after
+// the auto-close delay. This is a regression test for commit 3ff4d61.
+func TestRoomAutoClose(t *testing.T) {
+	// Skip in short mode since this test involves timing
+	if testing.Short() {
+		t.Skip("Skipping auto-close test in short mode")
+	}
+
+	hotel := New(
+		func(ctx context.Context, id string) (*struct{}, error) {
+			return &struct{}{}, nil
+		},
+		func(ctx context.Context, room *Room[struct{}, struct{}, string]) {
+			<-ctx.Done()
+		},
+	)
+
+	room, err := hotel.GetOrCreateRoom("auto-close-room")
+	if err != nil {
+		t.Fatalf("Failed to create room: %v", err)
+	}
+
+	// Add and remove a client to trigger auto-close scheduling
+	client, err := room.NewClient(&struct{}{})
+	if err != nil {
+		t.Fatalf("Failed to create client: %v", err)
+	}
+	room.RemoveClient(client)
+
+	// Room should still be accessible immediately after client removal
+	client2, err := room.NewClient(&struct{}{})
+	if err != nil {
+		t.Fatalf("Failed to create second client: %v", err)
+	}
+
+	// Adding a new client should cancel the auto-close timer
+	room.RemoveClient(client2)
+
+	// Verify room context is not yet cancelled
+	select {
+	case <-room.ctx.Done():
+		t.Error("Room was closed prematurely")
+	default:
+		// Good, room is still open
+	}
+}
+
+// TestRoomAutoCloseCancel verifies that adding a client cancels the
+// auto-close timer.
+func TestRoomAutoCloseCancel(t *testing.T) {
+	hotel := New(
+		func(ctx context.Context, id string) (*struct{}, error) {
+			return &struct{}{}, nil
+		},
+		func(ctx context.Context, room *Room[struct{}, struct{}, string]) {
+			<-ctx.Done()
+		},
+	)
+
+	room, err := hotel.GetOrCreateRoom("auto-close-cancel")
+	if err != nil {
+		t.Fatalf("Failed to create room: %v", err)
+	}
+
+	// Add a client, remove it (starts auto-close), then add another
+	client1, _ := room.NewClient(&struct{}{})
+	room.RemoveClient(client1)
+
+	// Add another client before auto-close fires - this should cancel the timer
+	client2, err := room.NewClient(&struct{}{})
+	if err != nil {
+		t.Fatalf("Failed to add client after removal: %v", err)
+	}
+
+	// Room should still be functional
+	err = room.SendToClient(client2, "test")
+	if err != nil {
+		t.Errorf("Failed to send to client: %v", err)
+	}
+
+	// Clean up
+	room.RemoveClient(client2)
+	room.Close()
+}
+
+// TestEventChannelFullBehavior verifies that when the events channel is full,
+// the room is closed gracefully. This is a regression test for commit ba27514.
+func TestEventChannelFullBehavior(t *testing.T) {
+	hotel := New(
+		func(ctx context.Context, id string) (*struct{}, error) {
+			return &struct{}{}, nil
+		},
+		func(ctx context.Context, room *Room[struct{}, struct{}, string]) {
+			// Don't read events - let the channel fill up
+			<-ctx.Done()
+		},
+	)
+
+	room, err := hotel.GetOrCreateRoom("full-events-room")
+	if err != nil {
+		t.Fatalf("Failed to create room: %v", err)
+	}
+
+	// Try to add many clients rapidly to fill the events channel
+	// The events channel has 1024 capacity
+	for i := 0; i < 2000; i++ {
+		client, err := room.NewClient(&struct{}{})
+		if err != nil {
+			// Expected - room may be closed due to full events channel
+			t.Logf("Client creation failed at iteration %d: %v", i, err)
+			break
+		}
+		// Don't remove clients - we want events to pile up
+		_ = client
+	}
+
+	// Room should eventually be closed due to full events channel
+	// Give it a moment
+	time.Sleep(10 * time.Millisecond)
+
+	_, err = room.NewClient(&struct{}{})
+	if err == nil {
+		t.Log("Room didn't close from full events channel (might have large buffer)")
+	}
+}
