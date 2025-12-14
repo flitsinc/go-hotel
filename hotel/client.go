@@ -32,11 +32,27 @@ func newClient[ClientMetadata, DataType any](bufferSize int, metadata *ClientMet
 	// Forward event data sent to sendCh (from any goroutine) to a channel that
 	// is synchronized to a single goroutine.
 	go func() {
+		defer close(c.sendCh)
 		for {
 			select {
 			case <-ctx.Done():
-				close(c.sendCh)
-				return
+				// Drain any remaining messages from bufferCh before closing.
+				// Use non-blocking sends so we don't hang if receiver is gone.
+				for {
+					select {
+					case data := <-c.bufferCh:
+						select {
+						case c.sendCh <- data:
+							// Forwarded successfully
+						default:
+							// Receiver not ready, stop draining
+							return
+						}
+					default:
+						// Buffer is empty, done draining
+						return
+					}
+				}
 			case data := <-c.bufferCh:
 				// Forwarding to sendCh will always block until the user code
 				// has read from the Receive() channel. If the buffer channel
@@ -44,8 +60,27 @@ func newClient[ClientMetadata, DataType any](bufferSize int, metadata *ClientMet
 				// is why we also check the context here.
 				select {
 				case <-ctx.Done():
-					close(c.sendCh)
-					return
+					// Try to forward the current message before draining
+					select {
+					case c.sendCh <- data:
+						// Forwarded, now drain the rest
+					default:
+						// Receiver not ready, give up
+						return
+					}
+					// Drain remaining messages
+					for {
+						select {
+						case data := <-c.bufferCh:
+							select {
+							case c.sendCh <- data:
+							default:
+								return
+							}
+						default:
+							return
+						}
+					}
 				case c.sendCh <- data:
 					// All good, keep going.
 				}

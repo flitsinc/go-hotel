@@ -37,48 +37,68 @@ func (h *Hotel[RoomMetadata, ClientMetadata, DataType]) GetOrCreateRoom(id strin
 		return nil, errors.New("invalid room id: cannot be empty")
 	}
 
-	// If a room exists we only need a read lock to retrieve it.
-	h.mu.RLock()
-	room, exists := h.rooms[id]
-	h.mu.RUnlock()
+	for {
+		var room *Room[RoomMetadata, ClientMetadata, DataType]
+		var exists bool
 
-	if !exists {
-		// A room might've been created in the short duration between RUnlock()
-		// and this code so now we need a write lock where we only create the
-		// room if it still doesn't exist.
-		h.mu.Lock()
+		// If a room exists we only need a read lock to retrieve it.
+		h.mu.RLock()
 		room, exists = h.rooms[id]
+		h.mu.RUnlock()
+
 		if !exists {
-			room = newRoom(id, h.init, h.handler)
-			h.rooms[id] = room
-		}
-		h.mu.Unlock()
-	}
-
-	// Wait for room init to run (or it might've already run in which case this
-	// will immediately return nil).
-	err := room.initGroup.Wait()
-
-	if !exists {
-		// This was the call that created the room, so do additional book
-		// keeping once its init has finished and we know if it errored.
-		if err != nil {
+			// A room might've been created in the short duration between RUnlock()
+			// and this code so now we need a write lock where we only create the
+			// room if it still doesn't exist.
 			h.mu.Lock()
-			delete(h.rooms, id)
+			room, exists = h.rooms[id]
+			if !exists {
+				room = newRoom(id, h.init, h.handler)
+				h.rooms[id] = room
+			}
 			h.mu.Unlock()
-		} else {
-			go func() {
-				<-room.ctx.Done()
+		}
+
+		// Wait for room init to run (or it might've already run in which case this
+		// will immediately return nil).
+		err := room.initGroup.Wait()
+
+		if !exists {
+			// This was the call that created the room, so do additional book
+			// keeping once its init has finished and we know if it errored.
+			if err != nil {
 				h.mu.Lock()
-				delete(h.rooms, room.id)
+				delete(h.rooms, id)
 				h.mu.Unlock()
-			}()
+			} else {
+				go func() {
+					<-room.ctx.Done()
+					h.mu.Lock()
+					delete(h.rooms, room.id)
+					h.mu.Unlock()
+				}()
+			}
+		}
+
+		if err != nil {
+			return nil, err
+		}
+
+		// Check if the room is still usable. If the room was closed between when
+		// we retrieved it and now, loop back to create a new one.
+		select {
+		case <-room.ctx.Done():
+			// Room is closed. Help clean it up and retry.
+			h.mu.Lock()
+			// Only delete if the same room is still in the map (another goroutine
+			// may have already replaced it with a new room).
+			if h.rooms[id] == room {
+				delete(h.rooms, id)
+			}
+			h.mu.Unlock()
+			continue
+		default:
+			return room, nil
 		}
 	}
-
-	if err != nil {
-		return nil, err
-	}
-
-	return room, nil
 }
