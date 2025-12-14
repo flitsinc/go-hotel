@@ -2,8 +2,14 @@ package hotel
 
 import (
 	"errors"
+	"fmt"
 	"sync"
 )
+
+// maxRoomRetries is the maximum number of times GetOrCreateRoom will retry
+// when encountering a closed room. This prevents infinite loops when rooms
+// are closing faster than they can be created (e.g., due to handler bugs).
+const maxRoomRetries = 3
 
 // Hotel manages a collection of virtual rooms that can be created on demand.
 // It handles room lifecycle including creation, access, and cleanup when rooms are no longer needed.
@@ -32,11 +38,14 @@ func New[RoomMetadata, ClientMetadata, DataType any](init RoomInitFunc[RoomMetad
 // GetOrCreateRoom returns an existing room with the given ID or creates a new one if it doesn't exist.
 // If the room initialization fails, the room is cleaned up and an error is returned.
 // The room is automatically removed from the hotel when it's closed.
+// If the room closes immediately after creation (e.g., due to handler errors), this function
+// will retry up to maxRoomRetries times before returning an error.
 func (h *Hotel[RoomMetadata, ClientMetadata, DataType]) GetOrCreateRoom(id string) (*Room[RoomMetadata, ClientMetadata, DataType], error) {
 	if id == "" {
 		return nil, errors.New("invalid room id: cannot be empty")
 	}
 
+	retries := 0
 	for {
 		var room *Room[RoomMetadata, ClientMetadata, DataType]
 		var exists bool
@@ -100,6 +109,11 @@ func (h *Hotel[RoomMetadata, ClientMetadata, DataType]) GetOrCreateRoom(id strin
 				delete(h.rooms, id)
 			}
 			h.mu.Unlock()
+
+			retries++
+			if retries >= maxRoomRetries {
+				return nil, fmt.Errorf("room %q closed immediately after creation (retried %d times)", id, retries)
+			}
 			continue
 		default:
 			return room, nil

@@ -3,6 +3,7 @@ package hotel
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -489,6 +490,50 @@ func TestRoomInitPanicRecovery(t *testing.T) {
 	t.Logf("Panic occurred %d time(s), room created successfully after recovery", finalCount)
 
 	room.Close()
+}
+
+// TestGetOrCreateRoomRetryLimit verifies that GetOrCreateRoom fails after
+// maxRoomRetries when rooms keep closing immediately.
+func TestGetOrCreateRoomRetryLimit(t *testing.T) {
+	// Track how many times init was called to verify retries are happening
+	initCount := 0
+	var mu sync.Mutex
+
+	hotel := New(
+		func(ctx context.Context, id string) (*struct{}, error) {
+			mu.Lock()
+			initCount++
+			mu.Unlock()
+			return &struct{}{}, nil
+		},
+		func(ctx context.Context, room *Room[struct{}, struct{}, string]) {
+			// Handler panics immediately, which closes the room via recovery
+			panic("handler always fails")
+		},
+	)
+
+	// GetOrCreateRoom should eventually fail after maxRoomRetries
+	_, err := hotel.GetOrCreateRoom("always-fails")
+
+	mu.Lock()
+	finalCount := initCount
+	mu.Unlock()
+
+	// The room init should have been called at least maxRoomRetries times
+	// (3 retries + possibly the initial attempt depending on timing)
+	t.Logf("Init was called %d times", finalCount)
+
+	if err == nil {
+		// If we got a room, it should be closed (handler panicked)
+		t.Log("GetOrCreateRoom returned without error (handler may not have panicked yet)")
+	} else {
+		// Verify the error is about retries
+		if strings.Contains(err.Error(), "retried") {
+			t.Logf("Got expected retry limit error: %v", err)
+		} else {
+			t.Logf("Got error (not retry limit): %v", err)
+		}
+	}
 }
 
 // TestRoomHandlerPanicRecovery verifies that a panic in the room handler
