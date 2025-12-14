@@ -189,8 +189,13 @@ func roomHandler(ctx context.Context, room *hotel.Room[RoomMetadata, UserMetadat
 				// Incoming message from a client.
 				switch msg := event.Data.(type) {
 				case *ChatMessage:
-					log.Printf("<%s> in %s: %s", event.Client.Metadata().Name, room.ID(), msg.Content)
-					room.BroadcastExcept(event.Client, event.Data)
+					name := event.Client.Metadata().Name
+					log.Printf("<%s> in %s: %s", name, room.ID(), msg.Content)
+					// Use authenticated name instead of client-provided name
+					room.BroadcastExcept(event.Client, &ChatMessage{
+						Name:    name,
+						Content: msg.Content,
+					})
 				default:
 					log.Printf("Unhandled message type: %T", msg)
 				}
