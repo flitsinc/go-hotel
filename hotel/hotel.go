@@ -74,7 +74,11 @@ func (h *Hotel[RoomMetadata, ClientMetadata, DataType]) GetOrCreateRoom(id strin
 				go func() {
 					<-room.ctx.Done()
 					h.mu.Lock()
-					delete(h.rooms, room.id)
+					// Only delete if this room is still in the map (another
+					// goroutine may have already replaced it with a new room).
+					if h.rooms[room.id] == room {
+						delete(h.rooms, room.id)
+					}
 					h.mu.Unlock()
 				}()
 			}
